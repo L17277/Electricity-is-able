@@ -1,0 +1,1381 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import random
+import time
+import math
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+from collections import deque
+import sqlite3
+import threading
+import json
+import pickle
+import os
+from enum import Enum
+
+class DisasterType(Enum):
+    NONE = 0
+    COOLANT_LEAK = 1
+    CONTROL_ROD_FAILURE = 2
+    POWER_SURGE = 3
+    EARTHQUAKE = 4
+    TSUNAMI = 5
+    TERRORIST_ATTACK = 6
+    XENON_POISONING = 7
+
+class ReactorPhysics:
+    """反应堆物理模型"""
+    
+    def __init__(self):
+        # 中子物理参数
+        self.neutron_population = 1e6  # 中子数量
+        self.generation_time = 1e-5  # 中子代时间 (s)
+        self.delayed_neutron_frac = 0.0065  # 缓发中子份额
+        self.prompt_neutron_lifetime = 1e-4  # 瞬发中子寿命 (s)
+        
+        # 反应性参数
+        self.reactivity = 0.0  # 总反应性
+        self.fuel_temp_coef = -2e-5  # 燃料温度系数 (1/°C)
+        self.coolant_temp_coef = -5e-5  # 冷却剂温度系数 (1/°C)
+        self.void_coef = -1e-4  # 空泡系数 (1/% void)
+        self.xenon_reactivity = 0.0  # 氙毒反应性
+        
+        # 氙毒模型
+        self.xenon_concentration = 0.0  # 氙-135浓度
+        self.iodine_concentration = 0.0  # 碘-135浓度
+        self.xenon_peak_time = 0  # 氙毒峰值时间
+        
+        # 裂变产物
+        self.fission_products = {
+            'I135': {'concentration': 0.0, 'half_life': 6.57},  # 碘-135 (小时)
+            'Xe135': {'concentration': 0.0, 'half_life': 9.14},  # 氙-135 (小时)
+            'Sm149': {'concentration': 0.0, 'half_life': 0}  # 钐-149 (稳定)
+        }
+    
+    def update_reactivity(self, fuel_temp, coolant_temp, void_fraction, power_level, control_rod_position, time_step):
+        """更新反应性"""
+        # 控制棒反应性
+        control_rod_reactivity = (100 - control_rod_position) * 1e-4
+        
+        # 温度反馈
+        temp_reactivity = (fuel_temp - 300) * self.fuel_temp_coef + (coolant_temp - 280) * self.coolant_temp_coef
+        
+        # 空泡反馈
+        void_reactivity = void_fraction * self.void_coef
+        
+        # 氙毒反应性
+        self.update_xenon_poisoning(power_level, time_step)
+        xenon_reactivity = -self.xenon_concentration * 1e-5
+        
+        # 总反应性
+        self.reactivity = control_rod_reactivity + temp_reactivity + void_reactivity + xenon_reactivity
+        
+        return self.reactivity
+    
+    def update_xenon_poisoning(self, power_level, time_step):
+        """更新氙毒模型"""
+        # 简化氙毒动力学方程
+        # 碘-135产生和衰变
+        iodine_production = power_level * 0.01  # 碘产生率
+        iodine_decay = self.iodine_concentration * math.log(2) / 6.57  # 碘衰变率 (6.57小时半衰期)
+        self.iodine_concentration += (iodine_production - iodine_decay) * time_step
+        
+        # 氙-135产生和衰变
+        xenon_production = iodine_decay  # 氙由碘衰变产生
+        xenon_decay = self.xenon_concentration * math.log(2) / 9.14  # 氙衰变率 (9.14小时半衰期)
+        xenon_burnup = self.xenon_concentration * power_level * 1e-6  # 氙燃耗
+        
+        self.xenon_concentration += (xenon_production - xenon_decay - xenon_burnup) * time_step
+        
+        # 限制浓度范围
+        self.xenon_concentration = max(0, self.xenon_concentration)
+        self.iodine_concentration = max(0, self.iodine_concentration)
+        
+        # 记录氙毒峰值时间
+        if self.xenon_concentration > 10 and self.xenon_peak_time == 0:
+            self.xenon_peak_time = time_step
+    
+    def calculate_power_change(self, reactivity, current_power, time_step):
+        """计算功率变化"""
+        # 简化点堆动力学方程
+        if reactivity > 0:
+            # 正反应性 - 功率增长
+            period = self.generation_time / reactivity
+            power_change = current_power * (math.exp(time_step / period) - 1)
+        else:
+            # 负反应性 - 功率下降
+            power_change = current_power * reactivity * time_step / self.generation_time
+        
+        return power_change
+
+class ReactorCore:
+    """反应堆核心监控模块"""
+    
+    def __init__(self):
+        self.power_level = 0  # MW
+        self.core_temperature = 300  # °C
+        self.neutron_flux = 1e12  # n/cm²/s
+        self.coolant_temperature = 280  # °C
+        self.coolant_pressure = 155  # bar
+        self.control_rod_position = 70  # %
+        self.fuel_enrichment = 4.5  # %
+        self.burnup = 0  # MWd/tU
+        self.operation_time = 0  # 小时
+        self.criticality = False
+        self.void_fraction = 0.1  # 空泡份额 (%)
+        
+        # 物理模型
+        self.physics = ReactorPhysics()
+        
+        # 历史数据记录
+        self.power_history = deque(maxlen=1000)
+        self.temperature_history = deque(maxlen=1000)
+        self.flux_history = deque(maxlen=1000)
+        self.reactivity_history = deque(maxlen=1000)
+        self.xenon_history = deque(maxlen=1000)
+        
+    def update(self, time_step=1, disaster_effect=0):
+        """更新反应堆状态"""
+        # 模拟反应堆物理
+        if self.criticality:
+            # 更新反应性
+            reactivity = self.physics.update_reactivity(
+                self.core_temperature,
+                self.coolant_temperature,
+                self.void_fraction,
+                self.power_level,
+                self.control_rod_position,
+                time_step
+            )
+            
+            # 计算功率变化
+            power_change = self.physics.calculate_power_change(reactivity, self.power_level, time_step)
+            self.power_level = max(0, min(1000, self.power_level + power_change))
+            
+            # 温度计算
+            heat_generation = self.power_level * 3  # 热功率
+            cooling_effect = self.coolant_flow_rate() * (self.coolant_temperature - 250) / 100
+            temp_change = (heat_generation - cooling_effect) / 500
+            self.core_temperature += temp_change
+            
+            # 空泡计算
+            self.update_void_fraction(time_step)
+            
+            # 中子通量
+            self.neutron_flux = 1e12 * (self.power_level / 1000) * random.uniform(0.95, 1.05)
+            
+            # 燃耗计算
+            self.burnup += self.power_level * time_step / 24  # MWd/tU
+            self.operation_time += time_step
+        else:
+            # 停堆状态
+            self.power_level *= 0.9  # 衰变热
+            self.core_temperature = max(300, self.core_temperature - 0.1)
+            self.neutron_flux = 1e5  # 本底水平
+            self.void_fraction = max(0, self.void_fraction - 0.01 * time_step)
+        
+        # 应用灾难影响
+        if disaster_effect > 0:
+            self.apply_disaster_effect(disaster_effect)
+        
+        # 记录历史数据
+        self.power_history.append(self.power_level)
+        self.temperature_history.append(self.core_temperature)
+        self.flux_history.append(self.neutron_flux)
+        self.reactivity_history.append(self.physics.reactivity)
+        self.xenon_history.append(self.physics.xenon_concentration)
+    
+    def update_void_fraction(self, time_step):
+        """更新空泡份额"""
+        # 空泡与功率和温度相关
+        target_void = 0.1 + (self.power_level / 1000) * 0.3 + (self.core_temperature - 300) / 1000
+        void_change = (target_void - self.void_fraction) * 0.1 * time_step
+        self.void_fraction = max(0, min(0.8, self.void_fraction + void_change))
+    
+    def apply_disaster_effect(self, effect):
+        """应用灾难影响"""
+        # 灾难会增加温度和压力
+        self.core_temperature += effect * 10
+        self.coolant_pressure += effect * 5
+        self.power_level = min(1000, self.power_level * (1 + effect * 0.1))
+        
+        # 灾难可能导致空泡增加
+        self.void_fraction = min(0.8, self.void_fraction + effect * 0.1)
+    
+    def coolant_flow_rate(self):
+        """计算冷却剂流量"""
+        return 8000 + (self.power_level / 1000) * 2000  # kg/s
+    
+    def start_up(self):
+        """启动反应堆"""
+        if not self.criticality:
+            self.criticality = True
+            self.power_level = 10  # 初始低功率
+            return True
+        return False
+    
+    def shutdown(self):
+        """停堆"""
+        self.criticality = False
+        self.control_rod_position = 100
+    
+    def adjust_control_rods(self, position):
+        """调整控制棒位置"""
+        self.control_rod_position = max(0, min(100, position))
+    
+    def get_physics_parameters(self):
+        """获取物理参数"""
+        return {
+            'reactivity': self.physics.reactivity,
+            'xenon_concentration': self.physics.xenon_concentration,
+            'iodine_concentration': self.physics.iodine_concentration,
+            'void_fraction': self.void_fraction,
+            'fuel_temp_coef': self.physics.fuel_temp_coef,
+            'coolant_temp_coef': self.physics.coolant_temp_coef,
+            'void_coef': self.physics.void_coef
+        }
+
+class FuelManager:
+    """燃料循环管理模块"""
+    
+    def __init__(self):
+        self.fuel_assemblies = []
+        self.current_cycle = 1
+        self.cycle_duration = 18  # 月
+        self.operation_days = 0
+        self.refueling_schedule = []
+        
+        # 初始化燃料组件
+        self.initialize_fuel_assemblies()
+    
+    def initialize_fuel_assemblies(self):
+        """初始化燃料组件"""
+        for i in range(157):  # 典型压水堆燃料组件数量
+            assembly = {
+                'id': i + 1,
+                'enrichment': 4.5,  # %
+                'burnup': 0,  # MWd/tU
+                'position': self.get_assembly_position(i),
+                'age': 0,  # 天
+                'status': 'active'
+            }
+            self.fuel_assemblies.append(assembly)
+    
+    def get_assembly_position(self, index):
+        """计算燃料组件在堆芯中的位置"""
+        rows = int(math.sqrt(len(self.fuel_assemblies)))
+        row = index // rows
+        col = index % rows
+        return (row, col)
+    
+    def update_burnup(self, power_level, time_step):
+        """更新燃耗"""
+        for assembly in self.fuel_assemblies:
+            if assembly['status'] == 'active':
+                # 简化燃耗计算
+                assembly['burnup'] += (power_level / 1000) * time_step * random.uniform(0.8, 1.2)
+                assembly['age'] += time_step / 24  # 转换为天
+    
+    def get_refueling_recommendation(self):
+        """获取换料建议"""
+        high_burnup_assemblies = [a for a in self.fuel_assemblies if a['burnup'] > 45000]  # MWd/tU
+        return {
+            'assemblies_to_replace': len(high_burnup_assemblies),
+            'average_burnup': sum(a['burnup'] for a in self.fuel_assemblies) / len(self.fuel_assemblies),
+            'max_burnup': max(a['burnup'] for a in self.fuel_assemblies)
+        }
+
+class CoolingSystem:
+    """冷却系统监控模块"""
+    
+    def __init__(self):
+        self.primary_flow = 8000  # kg/s
+        self.primary_temp_in = 290  # °C
+        self.primary_temp_out = 320  # °C
+        self.secondary_flow = 6000  # kg/s
+        self.steam_pressure = 70  # bar
+        self.steam_temperature = 285  # °C
+        self.condenser_pressure = 0.05  # bar
+        self.cooling_tower_temp = 35  # °C
+        self.emergency_cooling_ready = True
+        self.water_inventory = 100  # %
+        self.coolant_leak_rate = 0  # %/s
+        self.coolant_boron_concentration = 1000  # ppm
+    
+    def update(self, reactor_power, time_step, disaster_effect=0):
+        """更新冷却系统状态"""
+        # 一回路系统
+        self.primary_flow = 8000 + (reactor_power / 1000) * 2000
+        temp_increase = reactor_power * 0.03
+        self.primary_temp_out = self.primary_temp_in + temp_increase
+        
+        # 二回路系统
+        heat_transfer = reactor_power * 0.33  # 假设效率33%
+        self.steam_temperature = 250 + (heat_transfer / 1000) * 50
+        self.steam_pressure = 50 + (heat_transfer / 1000) * 30
+        
+        # 冷却塔
+        self.cooling_tower_temp = 30 + (reactor_power / 1000) * 15
+        
+        # 水库存消耗
+        self.water_inventory = max(0, self.water_inventory - 0.001 * time_step)
+        
+        # 应用灾难影响
+        if disaster_effect > 0:
+            self.apply_disaster_effect(disaster_effect, time_step)
+    
+    def apply_disaster_effect(self, effect, time_step):
+        """应用灾难影响"""
+        # 灾难会导致冷却剂泄漏
+        self.coolant_leak_rate = effect * 0.1
+        self.water_inventory = max(0, self.water_inventory - self.coolant_leak_rate * time_step)
+        self.primary_flow *= (1 - effect * 0.05)
+    
+    def adjust_boron_concentration(self, concentration):
+        """调整硼浓度"""
+        self.coolant_boron_concentration = max(0, concentration)
+
+class SafetySystem:
+    """安全系统监控模块"""
+    
+    def __init__(self):
+        self.radiation_levels = {
+            'core': 0.1,  # mSv/h
+            'containment': 0.01,
+            'turbine_hall': 0.001,
+            'environment': 0.0001,
+            'fuel_pool': 0.05,
+            'waste_storage': 0.1,
+            'control_room': 0.0005
+        }
+        self.containment_pressure = 1.0  # bar
+        self.containment_integrity = 100  # %
+        self.emergency_diesel_status = 'ready'
+        self.safety_injection_ready = True
+        self.containment_spray_ready = True
+        self.alarms = []
+        self.disaster_active = False
+        self.disaster_type = DisasterType.NONE
+        self.disaster_severity = 0
+    
+    def update(self, reactor, time_step):
+        """更新安全系统状态"""
+        # 辐射水平
+        if reactor.criticality:
+            self.radiation_levels['core'] = 100 + reactor.power_level * 0.9
+            self.radiation_levels['containment'] = self.radiation_levels['core'] * 0.001
+            self.radiation_levels['fuel_pool'] = 0.05 + reactor.power_level * 0.001
+        else:
+            self.radiation_levels['core'] = 0.1
+            self.radiation_levels['containment'] = 0.01
+            self.radiation_levels['fuel_pool'] = 0.05
+        
+        # 安全壳压力
+        if reactor.core_temperature > 500:
+            self.containment_pressure = 1.0 + (reactor.core_temperature - 500) / 1000
+        
+        # 应用灾难影响
+        if self.disaster_active:
+            self.apply_disaster_effect(reactor, time_step)
+        
+        # 检查报警条件
+        self.check_alarms(reactor)
+    
+    def apply_disaster_effect(self, reactor, time_step):
+        """应用灾难影响"""
+        if self.disaster_type == DisasterType.COOLANT_LEAK:
+            # 冷却剂泄漏导致温度和压力上升
+            reactor.core_temperature += self.disaster_severity * 5 * time_step
+            reactor.coolant_pressure += self.disaster_severity * 2 * time_step
+            
+        elif self.disaster_type == DisasterType.CONTROL_ROD_FAILURE:
+            # 控制棒失效导致功率失控
+            reactor.power_level = min(1000, reactor.power_level * (1 + self.disaster_severity * 0.1 * time_step))
+            
+        elif self.disaster_type == DisasterType.POWER_SURGE:
+            # 功率激增
+            reactor.power_level = min(1000, reactor.power_level * (1 + self.disaster_severity * 0.2 * time_step))
+            
+        elif self.disaster_type == DisasterType.EARTHQUAKE:
+            # 地震导致结构损坏
+            self.containment_integrity = max(0, self.containment_integrity - self.disaster_severity * 0.5 * time_step)
+            reactor.coolant_pressure += self.disaster_severity * 1 * time_step
+            
+        elif self.disaster_type == DisasterType.TSUNAMI:
+            # 海啸导致冷却系统失效
+            reactor.core_temperature += self.disaster_severity * 10 * time_step
+            
+        elif self.disaster_type == DisasterType.TERRORIST_ATTACK:
+            # 恐怖袭击导致多重系统失效
+            self.containment_integrity = max(0, self.containment_integrity - self.disaster_severity * 1 * time_step)
+            reactor.core_temperature += self.disaster_severity * 8 * time_step
+            reactor.coolant_pressure += self.disaster_severity * 3 * time_step
+            
+        elif self.disaster_type == DisasterType.XENON_POISONING:
+            # 氙毒导致反应性下降
+            reactor.physics.xenon_concentration += self.disaster_severity * 5 * time_step
+    
+    def check_alarms(self, reactor):
+        """检查并触发报警"""
+        self.alarms = []
+        
+        if reactor.core_temperature > 600:
+            self.alarms.append("高温报警: 堆芯温度过高")
+        if reactor.coolant_pressure > 180:
+            self.alarms.append("高压报警: 冷却剂压力过高")
+        if self.radiation_levels['containment'] > 1.0:
+            self.alarms.append("辐射报警: 安全壳辐射水平升高")
+        if reactor.power_level > 1050:
+            self.alarms.append("功率报警: 超功率运行")
+        if self.containment_integrity < 90:
+            self.alarms.append("结构报警: 安全壳完整性受损")
+        if reactor.physics.xenon_concentration > 20:
+            self.alarms.append("氙毒报警: 氙-135浓度过高")
+        if reactor.void_fraction > 0.5:
+            self.alarms.append("空泡报警: 空泡份额过高")
+        if self.disaster_active:
+            self.alarms.append(f"灾难报警: {self.disaster_type.name} 正在进行中")
+    
+    def trigger_disaster(self, disaster_type, severity=1.0):
+        """触发灾难"""
+        self.disaster_active = True
+        self.disaster_type = disaster_type
+        self.disaster_severity = severity
+        
+    def stop_disaster(self):
+        """停止灾难"""
+        self.disaster_active = False
+        self.disaster_type = DisasterType.NONE
+        self.disaster_severity = 0
+
+class PowerOutput:
+    """电力输出管理模块"""
+    
+    def __init__(self):
+        self.generated_power = 0  # MW
+        self.grid_demand = 800  # MW
+        self.turbine_speed = 3000  # RPM
+        self.generator_voltage = 24  # kV
+        self.grid_connection = True
+        self.transformer_status = 'normal'
+        self.efficiency = 0.33
+        self.power_history = deque(maxlen=1000)
+    
+    def update(self, reactor_power, time_step):
+        """更新电力输出状态"""
+        self.generated_power = reactor_power * self.efficiency
+        self.turbine_speed = 3000 + (reactor_power - 500) * 2
+        self.power_history.append(self.generated_power)
+        
+        # 模拟电网需求波动
+        self.grid_demand = 800 + random.uniform(-50, 50)
+
+class DataLogger:
+    """数据记录器"""
+    
+    def __init__(self):
+        self.conn = sqlite3.connect('nuclear_plant.db', check_same_thread=False)
+        self.create_tables()
+        self.log_count = 0
+        self.operation_log = []
+    
+    def create_tables(self):
+        """创建数据库表"""
+        cursor = self.conn.cursor()
+        
+        # 运行数据表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS operation_data (
+                timestamp DATETIME,
+                power REAL,
+                temperature REAL,
+                pressure REAL,
+                neutron_flux REAL,
+                radiation_level REAL,
+                reactivity REAL,
+                xenon_concentration REAL,
+                void_fraction REAL
+            )
+        ''')
+        
+        # 事件日志表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS event_log (
+                timestamp DATETIME,
+                event_type TEXT,
+                description TEXT,
+                severity TEXT
+            )
+        ''')
+        
+        # 操作记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_actions (
+                timestamp DATETIME,
+                action TEXT,
+                parameters TEXT,
+                result TEXT
+            )
+        ''')
+        
+        # 灾难记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS disaster_log (
+                timestamp DATETIME,
+                disaster_type TEXT,
+                severity REAL,
+                duration REAL,
+                damage_assessment TEXT
+            )
+        ''')
+        
+        # 物理参数表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS physics_parameters (
+                timestamp DATETIME,
+                reactivity REAL,
+                xenon_concentration REAL,
+                iodine_concentration REAL,
+                void_fraction REAL,
+                fuel_temp_coef REAL,
+                coolant_temp_coef REAL,
+                void_coef REAL
+            )
+        ''')
+        
+        self.conn.commit()
+    
+    def log_operation_data(self, reactor, safety_system):
+        """记录运行数据"""
+        cursor = self.conn.cursor()
+        physics_params = reactor.get_physics_parameters()
+        
+        cursor.execute('''
+            INSERT INTO operation_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            datetime.now(),
+            reactor.power_level,
+            reactor.core_temperature,
+            reactor.coolant_pressure,
+            reactor.neutron_flux,
+            safety_system.radiation_levels['core'],
+            physics_params['reactivity'],
+            physics_params['xenon_concentration'],
+            physics_params['void_fraction']
+        ))
+        
+        # 记录物理参数
+        cursor.execute('''
+            INSERT INTO physics_parameters VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            datetime.now(),
+            physics_params['reactivity'],
+            physics_params['xenon_concentration'],
+            physics_params['iodine_concentration'],
+            physics_params['void_fraction'],
+            physics_params['fuel_temp_coef'],
+            physics_params['coolant_temp_coef'],
+            physics_params['void_coef']
+        ))
+        
+        self.conn.commit()
+        self.log_count += 1
+        
+        # 每100条记录提交一次
+        if self.log_count >= 100:
+            self.conn.commit()
+            self.log_count = 0
+    
+    def log_event(self, event_type, description, severity="INFO"):
+        """记录事件"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO event_log VALUES (?, ?, ?, ?)
+        ''', (datetime.now(), event_type, description, severity))
+        self.conn.commit()
+        
+        # 同时添加到内存日志
+        self.operation_log.append({
+            'timestamp': datetime.now(),
+            'type': event_type,
+            'description': description,
+            'severity': severity
+        })
+    
+    def log_user_action(self, action, parameters, result):
+        """记录用户操作"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO user_actions VALUES (?, ?, ?, ?)
+        ''', (datetime.now(), action, json.dumps(parameters), result))
+        self.conn.commit()
+    
+    def log_disaster(self, disaster_type, severity, duration, damage):
+        """记录灾难"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO disaster_log VALUES (?, ?, ?, ?, ?)
+        ''', (datetime.now(), disaster_type.name, severity, duration, damage))
+        self.conn.commit()
+
+class NuclearPlantSimulator:
+    """核电站模拟器主类"""
+    
+    def __init__(self):
+        self.reactor = ReactorCore()
+        self.fuel_manager = FuelManager()
+        self.cooling_system = CoolingSystem()
+        self.safety_system = SafetySystem()
+        self.power_output = PowerOutput()
+        self.data_logger = DataLogger()
+        
+        self.simulation_time = 0  # 模拟时间（小时）
+        self.real_time_factor = 1  # 时间加速因子
+        self.running = False
+        self.emergency_procedures = []
+        self.disaster_start_time = None
+        
+        # 创建存档目录
+        if not os.path.exists('saves'):
+            os.makedirs('saves')
+        
+        # 启动数据记录线程
+        self.logging_thread = threading.Thread(target=self._logging_worker, daemon=True)
+        self.logging_thread.start()
+    
+    def _logging_worker(self):
+        """数据记录工作线程"""
+        while True:
+            if self.running:
+                self.data_logger.log_operation_data(self.reactor, self.safety_system)
+            time.sleep(1)  # 每秒记录一次
+    
+    def start_simulation(self):
+        """开始模拟"""
+        self.running = True
+        self.data_logger.log_event("SYSTEM", "模拟系统启动", "INFO")
+        self.data_logger.log_user_action("start_simulation", {}, "success")
+    
+    def stop_simulation(self):
+        """停止模拟"""
+        self.running = False
+        self.data_logger.log_event("SYSTEM", "模拟系统停止", "INFO")
+        self.data_logger.log_user_action("stop_simulation", {}, "success")
+    
+    def update(self, time_step=1):
+        """更新模拟状态"""
+        if not self.running:
+            return
+        
+        self.simulation_time += time_step
+        
+        # 计算灾难影响
+        disaster_effect = self.safety_system.disaster_severity if self.safety_system.disaster_active else 0
+        
+        # 更新各系统
+        self.reactor.update(time_step, disaster_effect)
+        self.fuel_manager.update_burnup(self.reactor.power_level, time_step)
+        self.cooling_system.update(self.reactor.power_level, time_step, disaster_effect)
+        self.safety_system.update(self.reactor, time_step)
+        self.power_output.update(self.reactor.power_level, time_step)
+        
+        # 记录灾难持续时间
+        if self.safety_system.disaster_active:
+            if self.disaster_start_time is None:
+                self.disaster_start_time = self.simulation_time
+        else:
+            if self.disaster_start_time is not None:
+                duration = self.simulation_time - self.disaster_start_time
+                damage = self.assess_disaster_damage()
+                self.data_logger.log_disaster(
+                    self.safety_system.disaster_type,
+                    self.safety_system.disaster_severity,
+                    duration,
+                    damage
+                )
+                self.disaster_start_time = None
+    
+    def assess_disaster_damage(self):
+        """评估灾难损害"""
+        damage = []
+        if self.reactor.core_temperature > 800:
+            damage.append("堆芯熔毁")
+        if self.safety_system.containment_integrity < 50:
+            damage.append("安全壳严重损坏")
+        if self.cooling_system.water_inventory < 10:
+            damage.append("冷却剂严重流失")
+        if self.safety_system.radiation_levels['environment'] > 1.0:
+            damage.append("环境辐射泄漏")
+        if self.reactor.physics.xenon_concentration > 50:
+            damage.append("严重氙毒")
+        
+        return ", ".join(damage) if damage else "轻微损坏"
+    
+    def get_plant_status(self):
+        """获取电站状态摘要"""
+        physics_params = self.reactor.get_physics_parameters()
+        
+        status = {
+            'power_level': self.reactor.power_level,
+            'core_temperature': self.reactor.core_temperature,
+            'coolant_pressure': self.reactor.coolant_pressure,
+            'generated_power': self.power_output.generated_power,
+            'grid_demand': self.power_output.grid_demand,
+            'radiation_level': self.safety_system.radiation_levels['core'],
+            'alarms': len(self.safety_system.alarms),
+            'criticality': self.reactor.criticality,
+            'operation_time': self.reactor.operation_time,
+            'containment_integrity': self.safety_system.containment_integrity,
+            'water_inventory': self.cooling_system.water_inventory,
+            'disaster_active': self.safety_system.disaster_active,
+            'disaster_type': self.safety_system.disaster_type.name if self.safety_system.disaster_active else "无",
+            'reactivity': physics_params['reactivity'],
+            'xenon_concentration': physics_params['xenon_concentration'],
+            'void_fraction': physics_params['void_fraction'],
+            'boron_concentration': self.cooling_system.coolant_boron_concentration
+        }
+        return status
+    
+    def execute_emergency_procedure(self, procedure_name):
+        """执行紧急程序"""
+        procedures = {
+            'scram': self._emergency_scram,
+            'safety_injection': self._safety_injection,
+            'containment_isolation': self._containment_isolation,
+            'boron_injection': self._boron_injection
+        }
+        
+        if procedure_name in procedures:
+            procedures[procedure_name]()
+            self.data_logger.log_event("EMERGENCY", f"执行紧急程序: {procedure_name}", "CRITICAL")
+            self.data_logger.log_user_action("emergency_procedure", {"procedure": procedure_name}, "executed")
+    
+    def _emergency_scram(self):
+        """紧急停堆"""
+        self.reactor.shutdown()
+        self.data_logger.log_event("REACTOR", "紧急停堆执行", "CRITICAL")
+    
+    def _safety_injection(self):
+        """安全注入"""
+        self.cooling_system.water_inventory = 100
+        self.data_logger.log_event("SAFETY", "安全注入系统启动", "HIGH")
+    
+    def _containment_isolation(self):
+        """安全壳隔离"""
+        self.safety_system.containment_integrity = 100
+        self.data_logger.log_event("SAFETY", "安全壳隔离执行", "HIGH")
+    
+    def _boron_injection(self):
+        """硼注入"""
+        self.cooling_system.coolant_boron_concentration = 2000
+        self.data_logger.log_event("SAFETY", "硼注入系统启动", "HIGH")
+    
+    def trigger_disaster(self, disaster_type, severity=1.0):
+        """触发灾难"""
+        self.safety_system.trigger_disaster(disaster_type, severity)
+        self.data_logger.log_event("DISASTER", f"灾难触发: {disaster_type.name} 严重度: {severity}", "CRITICAL")
+        self.data_logger.log_user_action("trigger_disaster", {"type": disaster_type.name, "severity": severity}, "triggered")
+    
+    def stop_disaster(self):
+        """停止灾难"""
+        self.safety_system.stop_disaster()
+        self.data_logger.log_event("DISASTER", "灾难已控制", "HIGH")
+        self.data_logger.log_user_action("stop_disaster", {}, "executed")
+    
+    def adjust_physics_parameter(self, parameter, value):
+        """调整物理参数"""
+        if parameter == "fuel_temp_coef":
+            self.reactor.physics.fuel_temp_coef = value
+        elif parameter == "coolant_temp_coef":
+            self.reactor.physics.coolant_temp_coef = value
+        elif parameter == "void_coef":
+            self.reactor.physics.void_coef = value
+        elif parameter == "boron_concentration":
+            self.cooling_system.adjust_boron_concentration(value)
+        
+        self.data_logger.log_user_action("adjust_physics_parameter", {"parameter": parameter, "value": value}, "success")
+    
+    def save_state(self, filename=None):
+        """保存模拟状态"""
+        if filename is None:
+            filename = f"saves/save_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
+        
+        state = {
+            'reactor': self.reactor,
+            'fuel_manager': self.fuel_manager,
+            'cooling_system': self.cooling_system,
+            'safety_system': self.safety_system,
+            'power_output': self.power_output,
+            'simulation_time': self.simulation_time,
+            'real_time_factor': self.real_time_factor,
+            'running': self.running
+        }
+        
+        with open(filename, 'wb') as f:
+            pickle.dump(state, f)
+        
+        self.data_logger.log_event("SYSTEM", f"状态已保存: {filename}", "INFO")
+        self.data_logger.log_user_action("save_state", {"filename": filename}, "success")
+        
+        return filename
+    
+    def load_state(self, filename):
+        """加载模拟状态"""
+        try:
+            with open(filename, 'rb') as f:
+                state = pickle.load(f)
+            
+            self.reactor = state['reactor']
+            self.fuel_manager = state['fuel_manager']
+            self.cooling_system = state['cooling_system']
+            self.safety_system = state['safety_system']
+            self.power_output = state['power_output']
+            self.simulation_time = state['simulation_time']
+            self.real_time_factor = state['real_time_factor']
+            self.running = state['running']
+            
+            self.data_logger.log_event("SYSTEM", f"状态已加载: {filename}", "INFO")
+            self.data_logger.log_user_action("load_state", {"filename": filename}, "success")
+            return True
+        except Exception as e:
+            self.data_logger.log_event("SYSTEM", f"加载状态失败: {str(e)}", "ERROR")
+            return False
+
+class NuclearPlantGUI:
+    """核电站模拟GUI界面"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("核电站模拟管理系统 - 增强版")
+        self.root.geometry("1400x900")
+        
+        # 创建模拟器实例
+        self.simulator = NuclearPlantSimulator()
+        
+        # 自动保存线程
+        self.auto_save_thread = threading.Thread(target=self._auto_save_worker, daemon=True)
+        self.auto_save_thread.start()
+        
+        # 创建GUI组件
+        self.create_widgets()
+        
+        # 启动模拟更新
+        self.update_interval = 1000  # 毫秒
+        self.update_simulation()
+    
+    def _auto_save_worker(self):
+        """自动保存工作线程"""
+        while True:
+            time.sleep(300)  # 每5分钟自动保存一次
+            if self.simulator.running:
+                self.simulator.save_state()
+    
+    def create_widgets(self):
+        """创建GUI组件"""
+        # 创建主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 配置网格权重
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        
+        # 创建标题
+        title_label = ttk.Label(main_frame, text="核电站模拟管理系统 - 增强版", font=("Arial", 16, "bold"))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 10))
+        
+        # 创建左侧控制面板
+        control_frame = ttk.LabelFrame(main_frame, text="控制面板", padding="10")
+        control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+        
+        # 创建右侧状态面板
+        status_frame = ttk.LabelFrame(main_frame, text="状态监控", padding="10")
+        status_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 配置控制面板网格
+        control_frame.columnconfigure(0, weight=1)
+        
+        # 配置状态面板网格
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.rowconfigure(1, weight=1)
+        
+        # 添加控制面板组件
+        self.create_control_panel(control_frame)
+        
+        # 添加状态面板组件
+        self.create_status_panel(status_frame)
+        
+        # 添加底部日志面板
+        log_frame = ttk.LabelFrame(main_frame, text="操作日志", padding="10")
+        log_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, width=100, height=10)
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 添加菜单
+        self.create_menu()
+    
+    def create_menu(self):
+        """创建菜单栏"""
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        # 文件菜单
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="文件", menu=file_menu)
+        file_menu.add_command(label="保存状态", command=self.save_state)
+        file_menu.add_command(label="加载状态", command=self.load_state)
+        file_menu.add_separator()
+        file_menu.add_command(label="退出", command=self.root.quit)
+        
+        # 模拟菜单
+        sim_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="模拟", menu=sim_menu)
+        sim_menu.add_command(label="启动模拟", command=self.start_simulation)
+        sim_menu.add_command(label="停止模拟", command=self.stop_simulation)
+        sim_menu.add_separator()
+        sim_menu.add_command(label="紧急停堆", command=lambda: self.simulator.execute_emergency_procedure('scram'))
+        
+        # 灾难菜单
+        disaster_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="灾难模拟", menu=disaster_menu)
+        for disaster in DisasterType:
+            if disaster != DisasterType.NONE:
+                disaster_menu.add_command(
+                    label=disaster.name, 
+                    command=lambda d=disaster: self.trigger_disaster(d)
+                )
+        disaster_menu.add_separator()
+        disaster_menu.add_command(label="停止所有灾难", command=self.stop_disaster)
+        
+        # 物理参数菜单
+        physics_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="物理参数", menu=physics_menu)
+        physics_menu.add_command(label="调整温度系数", command=self.show_temperature_coef_dialog)
+        physics_menu.add_command(label="调整空泡系数", command=self.show_void_coef_dialog)
+        physics_menu.add_command(label="调整硼浓度", command=self.show_boron_dialog)
+        physics_menu.add_command(label="查看物理状态", command=self.show_physics_status)
+    
+    def create_control_panel(self, parent):
+        """创建控制面板"""
+        # 模拟控制
+        sim_control_frame = ttk.Frame(parent)
+        sim_control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Button(sim_control_frame, text="启动模拟", command=self.start_simulation).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(sim_control_frame, text="停止模拟", command=self.stop_simulation).grid(row=0, column=1, padx=5)
+        ttk.Button(sim_control_frame, text="启动反应堆", command=self.start_reactor).grid(row=0, column=2, padx=5)
+        ttk.Button(sim_control_frame, text="停堆", command=self.stop_reactor).grid(row=0, column=3, padx=(5, 0))
+        
+        # 控制棒调整
+        control_rod_frame = ttk.LabelFrame(parent, text="控制棒位置", padding="5")
+        control_rod_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.control_rod_var = tk.DoubleVar(value=70)
+        control_rod_scale = ttk.Scale(
+            control_rod_frame, 
+            from_=0, 
+            to=100, 
+            variable=self.control_rod_var,
+            orient=tk.HORIZONTAL,
+            command=self.adjust_control_rods
+        )
+        control_rod_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        control_rod_frame.columnconfigure(0, weight=1)
+        
+        self.control_rod_label = ttk.Label(control_rod_frame, text="70%")
+        self.control_rod_label.grid(row=1, column=0)
+        
+        # 紧急程序
+        emergency_frame = ttk.LabelFrame(parent, text="紧急程序", padding="5")
+        emergency_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Button(emergency_frame, text="紧急停堆", 
+                  command=lambda: self.simulator.execute_emergency_procedure('scram')).grid(row=0, column=0, padx=(0, 5), pady=2)
+        ttk.Button(emergency_frame, text="安全注入", 
+                  command=lambda: self.simulator.execute_emergency_procedure('safety_injection')).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(emergency_frame, text="安全壳隔离", 
+                  command=lambda: self.simulator.execute_emergency_procedure('containment_isolation')).grid(row=0, column=2, padx=5, pady=2)
+        ttk.Button(emergency_frame, text="硼注入", 
+                  command=lambda: self.simulator.execute_emergency_procedure('boron_injection')).grid(row=0, column=3, padx=(5, 0), pady=2)
+        
+        # 灾难控制
+        disaster_frame = ttk.LabelFrame(parent, text="灾难模拟", padding="5")
+        disaster_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        disaster_types = [d for d in DisasterType if d != DisasterType.NONE]
+        self.disaster_var = tk.StringVar(value=disaster_types[0].name)
+        disaster_combo = ttk.Combobox(disaster_frame, textvariable=self.disaster_var, 
+                                     values=[d.name for d in disaster_types], state="readonly")
+        disaster_combo.grid(row=0, column=0, padx=(0, 5), pady=2, sticky=(tk.W, tk.E))
+        
+        ttk.Button(disaster_frame, text="触发灾难", command=self.trigger_disaster_from_ui).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(disaster_frame, text="停止灾难", command=self.stop_disaster).grid(row=0, column=2, padx=(5, 0), pady=2)
+        
+        disaster_frame.columnconfigure(0, weight=1)
+        
+        # 物理参数控制
+        physics_frame = ttk.LabelFrame(parent, text="物理参数调整", padding="5")
+        physics_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Button(physics_frame, text="温度系数", command=self.show_temperature_coef_dialog).grid(row=0, column=0, padx=(0, 5), pady=2)
+        ttk.Button(physics_frame, text="空泡系数", command=self.show_void_coef_dialog).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(physics_frame, text="硼浓度", command=self.show_boron_dialog).grid(row=0, column=2, padx=(5, 0), pady=2)
+        
+        physics_frame.columnconfigure(0, weight=1)
+        physics_frame.columnconfigure(1, weight=1)
+        physics_frame.columnconfigure(2, weight=1)
+        
+        # 存档控制
+        save_frame = ttk.Frame(parent)
+        save_frame.grid(row=5, column=0, sticky=(tk.W, tk.E))
+        
+        ttk.Button(save_frame, text="保存状态", command=self.save_state).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(save_frame, text="加载状态", command=self.load_state).grid(row=0, column=1, padx=5)
+        
+        save_frame.columnconfigure(0, weight=1)
+        save_frame.columnconfigure(1, weight=1)
+    
+    def create_status_panel(self, parent):
+        """创建状态面板"""
+        # 创建标签框架
+        status_grid = ttk.Frame(parent)
+        status_grid.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 配置网格
+        for i in range(6):
+            status_grid.columnconfigure(i, weight=1)
+        
+        # 状态标签
+        self.status_labels = {}
+        
+        # 第一行状态
+        status_data = [
+            ("反应堆功率", "power_level", "MW"),
+            ("堆芯温度", "core_temperature", "°C"),
+            ("冷却剂压力", "coolant_pressure", "bar"),
+            ("发电功率", "generated_power", "MW"),
+            ("电网需求", "grid_demand", "MW"),
+            ("辐射水平", "radiation_level", "mSv/h")
+        ]
+        
+        for i, (label, key, unit) in enumerate(status_data):
+            frame = ttk.Frame(status_grid, relief="solid", padding="5")
+            frame.grid(row=0, column=i, sticky=(tk.W, tk.E, tk.N, tk.S), padx=2, pady=2)
+            
+            ttk.Label(frame, text=label, font=("Arial", 10, "bold")).grid(row=0, column=0)
+            value_label = ttk.Label(frame, text="0", font=("Arial", 12))
+            value_label.grid(row=1, column=0)
+            ttk.Label(frame, text=unit).grid(row=2, column=0)
+            
+            self.status_labels[key] = value_label
+        
+        # 第二行状态
+        status_data2 = [
+            ("运行时间", "operation_time", "小时"),
+            ("报警数量", "alarms", "个"),
+            ("安全壳完整性", "containment_integrity", "%"),
+            ("水库存", "water_inventory", "%"),
+            ("反应堆状态", "criticality", ""),
+            ("灾难状态", "disaster_type", "")
+        ]
+        
+        for i, (label, key, unit) in enumerate(status_data2):
+            frame = ttk.Frame(status_grid, relief="solid", padding="5")
+            frame.grid(row=1, column=i, sticky=(tk.W, tk.E, tk.N, tk.S), padx=2, pady=2)
+            
+            ttk.Label(frame, text=label, font=("Arial", 10, "bold")).grid(row=0, column=0)
+            value_label = ttk.Label(frame, text="0", font=("Arial", 12))
+            value_label.grid(row=1, column=0)
+            if unit:
+                ttk.Label(frame, text=unit).grid(row=2, column=0)
+            
+            self.status_labels[key] = value_label
+        
+        # 第三行状态 - 物理参数
+        status_data3 = [
+            ("反应性", "reactivity", "pcm"),
+            ("氙浓度", "xenon_concentration", "a.u."),
+            ("空泡份额", "void_fraction", "%"),
+            ("硼浓度", "boron_concentration", "ppm"),
+            ("燃料温度系数", "fuel_temp_coef", "1/°C"),
+            ("冷却剂温度系数", "coolant_temp_coef", "1/°C")
+        ]
+        
+        for i, (label, key, unit) in enumerate(status_data3):
+            frame = ttk.Frame(status_grid, relief="solid", padding="5")
+            frame.grid(row=2, column=i, sticky=(tk.W, tk.E, tk.N, tk.S), padx=2, pady=2)
+            
+            ttk.Label(frame, text=label, font=("Arial", 9, "bold")).grid(row=0, column=0)
+            value_label = ttk.Label(frame, text="0", font=("Arial", 10))
+            value_label.grid(row=1, column=0)
+            ttk.Label(frame, text=unit, font=("Arial", 8)).grid(row=2, column=0)
+            
+            self.status_labels[key] = value_label
+        
+        # 报警显示
+        alarm_frame = ttk.LabelFrame(parent, text="当前报警", padding="5")
+        alarm_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        
+        alarm_frame.columnconfigure(0, weight=1)
+        alarm_frame.rowconfigure(0, weight=1)
+        
+        self.alarm_text = scrolledtext.ScrolledText(alarm_frame, width=60, height=8)
+        self.alarm_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+    
+    def start_simulation(self):
+        """启动模拟"""
+        self.simulator.start_simulation()
+        self.add_log("模拟已启动")
+    
+    def stop_simulation(self):
+        """停止模拟"""
+        self.simulator.stop_simulation()
+        self.add_log("模拟已停止")
+    
+    def start_reactor(self):
+        """启动反应堆"""
+        if self.simulator.reactor.start_up():
+            self.add_log("反应堆已启动")
+        else:
+            self.add_log("反应堆启动失败", "WARNING")
+    
+    def stop_reactor(self):
+        """停止反应堆"""
+        self.simulator.reactor.shutdown()
+        self.add_log("反应堆已停堆")
+    
+    def adjust_control_rods(self, value):
+        """调整控制棒位置"""
+        position = float(value)
+        self.simulator.reactor.adjust_control_rods(position)
+        self.control_rod_label.config(text=f"{position:.1f}%")
+        self.simulator.data_logger.log_user_action("adjust_control_rods", {"position": position}, "success")
+    
+    def trigger_disaster_from_ui(self):
+        """从UI触发灾难"""
+        disaster_name = self.disaster_var.get()
+        for disaster in DisasterType:
+            if disaster.name == disaster_name:
+                self.trigger_disaster(disaster)
+                break
+    
+    def trigger_disaster(self, disaster_type):
+        """触发灾难"""
+        severity = random.uniform(0.5, 2.0)
+        self.simulator.trigger_disaster(disaster_type, severity)
+        self.add_log(f"灾难已触发: {disaster_type.name} (严重度: {severity:.2f})", "CRITICAL")
+    
+    def stop_disaster(self):
+        """停止灾难"""
+        self.simulator.stop_disaster()
+        self.add_log("所有灾难已停止", "HIGH")
+    
+    def show_temperature_coef_dialog(self):
+        """显示温度系数调整对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("调整温度系数")
+        dialog.geometry("300x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="燃料温度系数 (1/°C):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        fuel_coef_var = tk.DoubleVar(value=self.simulator.reactor.physics.fuel_temp_coef)
+        fuel_coef_entry = ttk.Entry(dialog, textvariable=fuel_coef_var)
+        fuel_coef_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        ttk.Label(dialog, text="冷却剂温度系数 (1/°C):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        coolant_coef_var = tk.DoubleVar(value=self.simulator.reactor.physics.coolant_temp_coef)
+        coolant_coef_entry = ttk.Entry(dialog, textvariable=coolant_coef_var)
+        coolant_coef_entry.grid(row=1, column=1, padx=5, pady=5)
+        
+        def apply_changes():
+            self.simulator.adjust_physics_parameter("fuel_temp_coef", fuel_coef_var.get())
+            self.simulator.adjust_physics_parameter("coolant_temp_coef", coolant_coef_var.get())
+            self.add_log(f"温度系数已调整: 燃料={fuel_coef_var.get():.2e}, 冷却剂={coolant_coef_var.get():.2e}")
+            dialog.destroy()
+        
+        ttk.Button(dialog, text="应用", command=apply_changes).grid(row=2, column=0, columnspan=2, pady=10)
+    
+    def show_void_coef_dialog(self):
+        """显示空泡系数调整对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("调整空泡系数")
+        dialog.geometry("300x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="空泡系数 (1/% void):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        void_coef_var = tk.DoubleVar(value=self.simulator.reactor.physics.void_coef)
+        void_coef_entry = ttk.Entry(dialog, textvariable=void_coef_var)
+        void_coef_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        def apply_changes():
+            self.simulator.adjust_physics_parameter("void_coef", void_coef_var.get())
+            self.add_log(f"空泡系数已调整: {void_coef_var.get():.2e}")
+            dialog.destroy()
+        
+        ttk.Button(dialog, text="应用", command=apply_changes).grid(row=1, column=0, columnspan=2, pady=10)
+    
+    def show_boron_dialog(self):
+        """显示硼浓度调整对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("调整硼浓度")
+        dialog.geometry("300x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="硼浓度 (ppm):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        boron_var = tk.DoubleVar(value=self.simulator.cooling_system.coolant_boron_concentration)
+        boron_entry = ttk.Entry(dialog, textvariable=boron_var)
+        boron_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        def apply_changes():
+            self.simulator.adjust_physics_parameter("boron_concentration", boron_var.get())
+            self.add_log(f"硼浓度已调整: {boron_var.get()} ppm")
+            dialog.destroy()
+        
+        ttk.Button(dialog, text="应用", command=apply_changes).grid(row=1, column=0, columnspan=2, pady=10)
+    
+    def show_physics_status(self):
+        """显示物理状态对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("物理状态详情")
+        dialog.geometry("400x300")
+        dialog.transient(self.root)
+        
+        physics_params = self.simulator.reactor.get_physics_parameters()
+        
+        text_area = scrolledtext.ScrolledText(dialog, width=50, height=15)
+        text_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        
+        text_area.insert(tk.END, "=== 反应堆物理状态 ===\n\n")
+        text_area.insert(tk.END, f"反应性: {physics_params['reactivity']:.4f} pcm\n")
+        text_area.insert(tk.END, f"氙-135浓度: {physics_params['xenon_concentration']:.2f}\n")
+        text_area.insert(tk.END, f"碘-135浓度: {physics_params['iodine_concentration']:.2f}\n")
+        text_area.insert(tk.END, f"空泡份额: {physics_params['void_fraction']*100:.2f}%\n")
+        text_area.insert(tk.END, f"燃料温度系数: {physics_params['fuel_temp_coef']:.2e} 1/°C\n")
+        text_area.insert(tk.END, f"冷却剂温度系数: {physics_params['coolant_temp_coef']:.2e} 1/°C\n")
+        text_area.insert(tk.END, f"空泡系数: {physics_params['void_coef']:.2e} 1/% void\n")
+        
+        text_area.config(state=tk.DISABLED)
+    
+    def save_state(self):
+        """保存状态"""
+        filename = self.simulator.save_state()
+        self.add_log(f"状态已保存: {filename}")
+    
+    def load_state(self):
+        """加载状态"""
+        filename = tk.filedialog.askopenfilename(
+            title="选择存档文件",
+            initialdir="saves",
+            filetypes=[("存档文件", "*.pkl")]
+        )
+        
+        if filename and self.simulator.load_state(filename):
+            self.add_log(f"状态已加载: {filename}")
+            # 更新UI以反映加载的状态
+            self.update_status_display()
+        else:
+            self.add_log("加载状态失败", "ERROR")
+    
+    def add_log(self, message, severity="INFO"):
+        """添加日志"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if severity == "CRITICAL":
+            tag = "critical"
+        elif severity == "HIGH":
+            tag = "high"
+        elif severity == "WARNING":
+            tag = "warning"
+        elif severity == "ERROR":
+            tag = "error"
+        else:
+            tag = "info"
+        
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", tag)
+        self.log_text.see(tk.END)
+        
+        # 配置标签样式
+        self.log_text.tag_config("critical", foreground="red", font=("Arial", 9, "bold"))
+        self.log_text.tag_config("high", foreground="orange", font=("Arial", 9, "bold"))
+        self.log_text.tag_config("warning", foreground="yellow")
+        self.log_text.tag_config("error", foreground="red")
+        self.log_text.tag_config("info", foreground="white")
+    
+    def update_status_display(self):
+        """更新状态显示"""
+        status = self.simulator.get_plant_status()
+        
+        # 更新数值显示
+        for key, label in self.status_labels.items():
+            if key in status:
+                value = status[key]
+                if key == "criticality":
+                    display_value = "临界" if value else "停堆"
+                elif key == "operation_time":
+                    display_value = f"{value:.1f}"
+                elif key in ["fuel_temp_coef", "coolant_temp_coef", "void_coef"]:
+                    display_value = f"{value:.2e}"
+                elif key == "reactivity":
+                    display_value = f"{value*1e5:.1f}"  # 转换为pcm
+                elif isinstance(value, float):
+                    display_value = f"{value:.2f}"
+                else:
+                    display_value = str(value)
+                
+                label.config(text=display_value)
+                
+                # 根据数值设置颜色
+                if key in ["core_temperature", "coolant_pressure", "radiation_level"] and value > self.get_warning_threshold(key):如果键在[“core_temperature”、“coolant_pressure”、“radiation_level”]中且值大于self.get_warning_threshold(键)：
+                    label.config(foreground="red")
+                elif key in ["containment_integrity", "water_inventory"] and value < 50:如果键在[“ containment_integrity”、“water_inventory”]中且值小于50：
+                    label.config(foreground="orange")
+                elif key == "reactivity" and abs(value) > 0.01:如果键等于“反应性”且反应性的绝对值大于0.01：
+                    label.config(foreground="orange" if value > 0 else "blue")label.config(前景色="橙色" if 值 > 0 else "蓝色")
+                elif key == "xenon_concentration" and value > 20:如果键等于“氙浓度”且值大于20：
+                    label.config(foreground="orange")
+                elif key == "void_fraction" and value > 0.5:
+                    label.config(foreground="orange")
+                else:
+                    label.config(foreground="black")
+        
+        # 更新报警显示
+        self.alarm_text.delete(1.0, tk.END)
+        for alarm in self.simulator.safety_system.alarms:对于模拟器安全系统中的每个警报：
+            self.alarm_text.insert(tk.END, f"⚠ {alarm}\n")
+    
+    def get_warning_threshold(self, parameter):
+        """获取参数警告阈值"""
+        thresholds = {阈值 = {
+            "core_temperature": 600,"堆芯温度": 600,"堆芯温度": 600，堆芯温度": 600,"堆芯温度": 600，堆芯温度": 600，堆芯温度": 600，堆芯温度": 600，"核心温度": 600, "堆芯温度": 600, "堆芯温度": 600，"堆芯温度": 600, "堆芯温度": 600，"堆芯温度": 600，"堆芯温度": 600，"堆芯温度": 600，“核心温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“核心温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，“堆芯温度”：600，
+            "coolant_pressure": 180,"冷却液压力": 180,"冷却液压力": 180，冷却液压力": 180,"冷却液压力": 180，冷却液压力": 180，冷却液压力": 180，冷却液压力": 180，"冷却液压力": 180"冷却液压力": 180"冷却液压力": 180,"冷却液压力": 180,"冷却液压力": 180，冷却液压力": 180,"冷却液压力": 180，冷却液压力": 180，冷却液压力": 180，冷却液压力": 180，"冷却液压力": 180"冷却液压力": 180“冷却液压力”：180，“冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180“冷却液压力”：180“冷却液压力”：180，“冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180“冷却液压力”：180“冷却液压力”：180，“冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，冷却液压力”：180，“冷却液压力”：180“冷却液压力”：180
+            "radiation_level": 10"辐射水平": 10"辐射水平": 10"辐射水平": 10“辐射水平”：10“辐射水平”：10"辐射水平": 10"辐射水平": 10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10“辐射水平”：10
+        }
+        return thresholds.get(parameter, 1000)
+    
+    def update_simulation(self):
+        """更新模拟"""
+        if self.simulator.running:
+            self.simulator.update()
+            self.update_status_display()
+        
+        # 安排下一次更新
+        self.root.after(self.update_interval, self.update_simulation)
+
+def main():
+    """主函数"""
+    root = tk.Tk()
+    app = NuclearPlantGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
